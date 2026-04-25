@@ -1,0 +1,10 @@
+Debug/
+Release/
+*.d
+*.o
+*.su
+*.elf
+*.bin
+*.map
+*.lst
+.settings/

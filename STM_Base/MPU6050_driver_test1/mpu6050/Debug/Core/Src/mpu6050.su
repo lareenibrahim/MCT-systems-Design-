@@ -1,0 +1,7 @@
+../Core/Src/mpu6050.c:4:14:accel_lsb	16	static
+../Core/Src/mpu6050.c:15:14:gyro_lsb	16	static
+../Core/Src/mpu6050.c:27:23:write_reg	32	static
+../Core/Src/mpu6050.c:36:23:read_regs	32	static
+../Core/Src/mpu6050.c:49:16:MPU6050_Init	32	static
+../Core/Src/mpu6050.c:92:16:MPU6050_ReadRaw	32	static
+../Core/Src/mpu6050.c:115:16:MPU6050_ReadScaled	40	static

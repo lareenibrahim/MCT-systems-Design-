@@ -1,0 +1,10 @@
+18:41:57 **** Incremental Build of configuration Debug for project mpu6050 ****
+make -j20 all 
+arm-none-eabi-size  mpu6050.elf 
+   text	   data	    bss	    dec	    hex	filename
+  28476	    468	   2100	  31044	   7944	mpu6050.elf
+Finished building: default.size.stdout
+ 
+
+18:41:58 Build Finished. 0 errors, 0 warnings. (took 350ms)
+

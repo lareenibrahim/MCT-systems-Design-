@@ -1,0 +1,21 @@
+!SESSION 2026-04-24 17:33:23.249 -----------------------------------------------
+eclipse.buildId=Version 1.19.0
+java.version=21.0.3
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=win32, ARCH=x86_64, WS=win32, NL=en_US
+Command-line arguments:  -os win32 -ws win32 -arch x86_64
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 4 4 2026-04-24 17:33:39.948
+!MESSAGE CubeMX plugin appears to be active, Log4j initialization might be too late.
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-04-24 17:33:39.950
+!MESSAGE Log4j2 initialized with config file F:\MCT_Systems_Design_Proj\Embedded-Tasks\MPU6050_driver_test1\.metadata\.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-04-24 17:33:43.109
+!MESSAGE Started RMI Server, listening on port 41337
+
+!ENTRY org.eclipse.cdt.core 1 0 2026-04-24 17:35:44.515
+!MESSAGE Indexed 'mpu6050' (19 sources, 81 headers) in 2.22 sec: 4,288 declarations; 17,965 references; 0 unresolved inclusions; 1 syntax errors; 2 unresolved names (0.009%)
+
+!ENTRY org.eclipse.cdt.core 1 0 2026-04-24 18:41:10.293
+!MESSAGE Indexed 'mpu6050' (23 sources, 85 headers) in 0.796 sec: 5,652 declarations; 34,271 references; 0 unresolved inclusions; 1 syntax errors; 2 unresolved names (0.005%)

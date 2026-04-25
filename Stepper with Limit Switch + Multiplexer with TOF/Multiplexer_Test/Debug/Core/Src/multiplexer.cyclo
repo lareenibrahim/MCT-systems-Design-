@@ -1,9 +1,0 @@
-../Core/Src/multiplexer.c:41:26:TCA9548A_WriteControl	4
-../Core/Src/multiplexer.c:64:26:TCA9548A_ReadControl	5
-../Core/Src/multiplexer.c:85:19:TCA9548A_Init	5
-../Core/Src/multiplexer.c:139:19:TCA9548A_SelectChannel	3
-../Core/Src/multiplexer.c:154:19:TCA9548A_SetChannelMask	2
-../Core/Src/multiplexer.c:163:19:TCA9548A_DisableAll	2
-../Core/Src/multiplexer.c:171:19:TCA9548A_ReadChannelMask	2
-../Core/Src/multiplexer.c:183:19:TCA9548A_Reset	3
-../Core/Src/multiplexer.c:208:6:TCA9548A_ScanChannel	7

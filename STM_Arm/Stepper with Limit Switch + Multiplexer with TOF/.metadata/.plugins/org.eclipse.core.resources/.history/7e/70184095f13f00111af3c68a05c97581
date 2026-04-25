@@ -1,0 +1,92 @@
+/*
+ * limit_switch.h
+ *
+ *  Created on: Apr 24, 2026
+ *      Author: Mohamed
+ */
+
+#ifndef INC_LIMIT_SWITCH_H_
+#define INC_LIMIT_SWITCH_H_
+
+#include <stdint.h>
+#include "stm32f1xx_hal.h"
+// ══════════════════════════════════════════════════════════════
+// ── WIRING CONFIGURATION  (edit here only) ───────────────────
+// ══════════════════════════════════════════════════════════════
+//
+//  Set each switch type to either:
+//    SWITCH_NO   → Normally Open   (pin idles HIGH via pull-up, goes LOW on press)
+//    SWITCH_NC   → Normally Closed (pin idles LOW  via pull-down, goes HIGH on press)
+//
+#define SWITCH_NO   0
+#define SWITCH_NC   1
+
+#define ARM_LIMIT_TYPE        SWITCH_NO   // ← change to SWITCH_NC if needed
+#define GRIPPER_LIMIT_TYPE    SWITCH_NO   // ← change to SWITCH_NC if needed
+
+// ══════════════════════════════════════════════════════════════
+// ── Pin Definitions ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+#define ARM_LIMIT_PIN           GPIO_PIN_12
+#define ARM_LIMIT_PORT          GPIOB
+#define ARM_LIMIT_IRQn          EXTI15_10_IRQn
+
+#define GRIPPER_LIMIT_PIN       GPIO_PIN_13
+#define GRIPPER_LIMIT_PORT      GPIOB
+#define GRIPPER_LIMIT_IRQn      EXTI15_10_IRQn
+
+// ══════════════════════════════════════════════════════════════
+// ── GPIO Mode & Pull auto-selected by wiring type ────────────
+// ══════════════════════════════════════════════════════════════
+//
+//  NO switch → enable internal PULL-UP,  trigger on FALLING edge (press = LOW)
+//  NC switch → enable internal PULL-DOWN, trigger on RISING edge  (press = HIGH)
+//
+#if (ARM_LIMIT_TYPE == SWITCH_NO)
+    #define ARM_LIMIT_GPIO_PULL     GPIO_PULLUP
+    #define ARM_LIMIT_GPIO_MODE     GPIO_MODE_IT_FALLING
+#elif (ARM_LIMIT_TYPE == SWITCH_NC)
+    #define ARM_LIMIT_GPIO_PULL     GPIO_PULLDOWN
+    #define ARM_LIMIT_GPIO_MODE     GPIO_MODE_IT_RISING
+#else
+    #error "ARM_LIMIT_TYPE must be SWITCH_NO or SWITCH_NC"
+#endif
+
+#if (GRIPPER_LIMIT_TYPE == SWITCH_NO)
+    #define GRIPPER_LIMIT_GPIO_PULL GPIO_PULLUP
+    #define GRIPPER_LIMIT_GPIO_MODE GPIO_MODE_IT_FALLING
+#elif (GRIPPER_LIMIT_TYPE == SWITCH_NC)
+    #define GRIPPER_LIMIT_GPIO_PULL GPIO_PULLDOWN
+    #define GRIPPER_LIMIT_GPIO_MODE GPIO_MODE_IT_RISING
+#else
+    #error "GRIPPER_LIMIT_TYPE must be SWITCH_NO or SWITCH_NC"
+#endif
+
+// ══════════════════════════════════════════════════════════════
+// ── Homing / Backoff Parameters ──────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+#define HOMING_BACKOFF_STEPS      400
+#define HOMING_BACKOFF_DELAY_US   500
+
+// ══════════════════════════════════════════════════════════════
+// ── Debounce ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+#define LIMIT_DEBOUNCE_MS         50
+
+// ══════════════════════════════════════════════════════════════
+// ── Public Flags ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+extern volatile uint8_t arm_limit_triggered;
+extern volatile uint8_t gripper_cube_detected;
+
+// ══════════════════════════════════════════════════════════════
+// ── Function Declarations ────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+void LimitSwitch_Init(void);
+void LimitSwitch_EXTI_Callback(uint16_t GPIO_Pin);
+#endif /* INC_LIMIT_SWITCH_H_ */

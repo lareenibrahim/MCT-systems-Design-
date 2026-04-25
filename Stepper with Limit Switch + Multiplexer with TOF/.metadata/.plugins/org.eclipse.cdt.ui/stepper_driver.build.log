@@ -1,0 +1,10 @@
+18:26:06 **** Incremental Build of configuration Debug for project stepper_driver ****
+make -j16 all 
+arm-none-eabi-size  stepper_driver.elf 
+   text	   data	    bss	    dec	    hex	filename
+   8036	     12	   1668	   9716	   25f4	stepper_driver.elf
+Finished building: default.size.stdout
+ 
+
+18:26:08 Build Finished. 0 errors, 0 warnings. (took 1s.810ms)
+

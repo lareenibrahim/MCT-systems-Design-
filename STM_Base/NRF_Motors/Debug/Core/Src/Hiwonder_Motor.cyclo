@@ -1,0 +1,9 @@
+../Core/Src/Hiwonder_Motor.c:7:18:clamp_speed	3
+../Core/Src/Hiwonder_Motor.c:18:6:Motor_Init	1
+../Core/Src/Hiwonder_Motor.c:34:19:Motor_SetType	1
+../Core/Src/Hiwonder_Motor.c:42:19:Motor_SetPolarity	1
+../Core/Src/Hiwonder_Motor.c:50:19:Motor_ResetEncoders	1
+../Core/Src/Hiwonder_Motor.c:59:19:Motor_SetSpeeds	1
+../Core/Src/Hiwonder_Motor.c:72:19:Motor_ReadEncoders	3
+../Core/Src/Hiwonder_Motor.c:91:19:Motor_ReadVoltage	2
+../Core/Src/Hiwonder_Motor.c:105:19:Motor_GetKinematics	5

@@ -1,0 +1,8 @@
+../Core/Src/motor_test.c:7:13:test_print	16	static
+../Core/Src/motor_test.c:25:13:flush_rx_buffer	8	static
+../Core/Src/motor_test.c:49:13:run_single_motor_test	360	static
+../Core/Src/motor_test.c:98:13:run_pwm_sweep	280	static
+../Core/Src/motor_test.c:146:13:run_step_response	192	static
+../Core/Src/motor_test.c:207:10:Motor_StepSingleShot	184	static
+../Core/Src/motor_test.c:186:6:Motor_Test_Run	16	static
+../Core/Src/motor_test.c:227:10:Motor_RunContinuous	80	static

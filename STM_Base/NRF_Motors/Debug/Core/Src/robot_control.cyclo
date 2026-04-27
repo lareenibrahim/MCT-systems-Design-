@@ -1,0 +1,7 @@
+../Core/Src/robot_control.c:39:6:Robot_Init	2
+../Core/Src/robot_control.c:75:6:Kinematics_Inverse	1
+../Core/Src/robot_control.c:116:7:PID_Compute	11
+../Core/Src/robot_control.c:176:6:Robot_UpdateControl	9
+../Core/Src/robot_control.c:234:6:Robot_PIDUpdate	2
+../Core/Src/robot_control.c:251:6:Robot_SetGains	5
+../Core/Src/robot_control.c:258:6:Robot_GetTargets	2

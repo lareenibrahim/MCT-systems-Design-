@@ -1,0 +1,4 @@
+../Core/Src/bmp180.c:8:22:_write_reg	2
+../Core/Src/bmp180.c:20:22:_read_regs	3
+../Core/Src/bmp180.c:38:15:BMP180_Init	7
+../Core/Src/bmp180.c:76:15:BMP180_ReadScaled	8

@@ -1,0 +1,4 @@
+../Core/Src/Base_Manual.c:24:6:DC_Init	1
+../Core/Src/Base_Manual.c:37:6:DC_Execute	11
+../Core/Src/Base_Manual.c:55:6:DC_Stop	1
+../Core/Src/Base_Manual.c:65:6:DC_UpdateRamp	6

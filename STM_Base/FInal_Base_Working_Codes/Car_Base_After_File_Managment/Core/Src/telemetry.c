@@ -1,0 +1,95 @@
+/*
+ * telemetry.c
+ *
+ *  Created on: Jun 10, 2026
+ *      Author: Osama Mohammed
+ */
+
+/*
+#include "telemetry.h"
+#include "comm_parser.h"
+#include "sensor_sys.h"
+#include "Hiwonder_Motor.h"
+#include <stdio.h>
+
+uint16_t battery_voltage = 0;
+int32_t  encoders[4] = {0, 0, 0, 0};
+float    distances[4] = {0, 0, 0, 0};
+float    rpms[4] = {0, 0, 0, 0};
+
+void Telemetry_UpdateTick(void)
+{
+    static uint32_t last_telemetry_time = 0;
+
+    if (HAL_GetTick() - last_telemetry_time >= 500)
+    {
+        last_telemetry_time = HAL_GetTick();
+
+        Motor_ReadVoltage(&battery_voltage); HAL_Delay(5);
+        Motor_ReadEncoders(encoders); HAL_Delay(5);
+        Motor_GetKinematics(distances, rpms);
+        BMP180_ReadScaled(&baro, &sensor_data);
+        MAG_Read(&mag);
+        MPU6050_ReadScaled(&imu, &imu_data);
+
+        char msg1[150];
+        snprintf(msg1, sizeof(msg1), "VOLT:%u | ENC:%ld,%ld,%ld,%ld | RPM:%.1f,%.1f,%.1f,%.1f\r\n",
+                battery_voltage, encoders[0], encoders[1], encoders[2], encoders[3], rpms[0], rpms[1], rpms[2], rpms[3]);
+        USB_Print(msg1);
+
+        char msg2[150];
+        snprintf(msg2, sizeof(msg2), "GYRO Z: %.2f | HDG: %.1f | MAG X:%.1f Y:%.1f Z:%.1f\r\n",
+                 imu_data.gyro.z, mag.heading, mag.x_uT, mag.y_uT, mag.z_uT);
+        USB_Print(msg2);
+    }
+}
+*/
+
+
+/*
+ * telemetry.c
+ *
+ *  Created on: Jun 10, 2026
+ *      Author: Osama Mohammed
+ */
+#include "telemetry.h"
+#include "comm_parser.h"
+#include "sensor_sys.h"
+#include "Hiwonder_Motor.h"
+#include <stdio.h>
+
+uint16_t battery_voltage = 0;
+int32_t  encoders[4] = {0, 0, 0, 0};
+float    distances[4] = {0, 0, 0, 0};
+float    rpms[4] = {0, 0, 0, 0};
+
+void Telemetry_UpdateTick(void)
+{
+    static uint32_t last_telemetry_time = 0;
+    if (HAL_GetTick() - last_telemetry_time >= 500)
+    {
+        last_telemetry_time = HAL_GetTick();
+
+        Motor_ReadVoltage(&battery_voltage); HAL_Delay(5);
+        Motor_ReadEncoders(encoders); HAL_Delay(5);
+        Motor_GetKinematics(distances, rpms);
+        BMP180_ReadScaled(&baro, &sensor_data);
+
+        // FIX (Bug 5): Removed MAG_Read() and MPU6050_ReadScaled() from here.
+        // These were overwriting imu_data.gyro.z and mag.heading mid-move,
+        // corrupting the heading fusion in Chassis_UpdateTick() on that tick.
+        // Both sensors are already read every 20ms in Chassis_UpdateTick() —
+        // use those live values directly for telemetry printing below.
+
+        char msg1[150];
+        snprintf(msg1, sizeof(msg1), "VOLT:%u | ENC:%ld,%ld,%ld,%ld | RPM:%.1f,%.1f,%.1f,%.1f\r\n",
+                battery_voltage, encoders[0], encoders[1], encoders[2], encoders[3], rpms[0], rpms[1], rpms[2], rpms[3]);
+        USB_Print(msg1);
+
+        char msg2[150];
+        snprintf(msg2, sizeof(msg2), "GYRO Z: %.2f | HDG: %.1f | MAG X:%.1f Y:%.1f Z:%.1f\r\n",
+                 imu_data.gyro.z, global_current_heading, mag.x_uT, mag.y_uT, mag.z_uT);
+        USB_Print(msg2);
+    }
+}
+

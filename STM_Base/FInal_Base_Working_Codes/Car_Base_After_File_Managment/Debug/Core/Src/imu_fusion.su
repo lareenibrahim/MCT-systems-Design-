@@ -1,0 +1,2 @@
+../Core/Src/imu_fusion.c:10:6:HeadingFusion_Init	24	static
+../Core/Src/imu_fusion.c:18:7:HeadingFusion_Update	32	static

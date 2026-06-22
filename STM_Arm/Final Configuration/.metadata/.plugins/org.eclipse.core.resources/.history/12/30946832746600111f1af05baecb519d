@@ -1,0 +1,66 @@
+/*
+ * sensor_sys.c
+ *
+ *  Created on: Jun 10, 2026
+ *      Author: Osama Mohammed
+ */
+
+#include "sensor_sys.h"
+#include "comm_parser.h"
+#include <stdio.h>
+
+MPU6050            imu;
+MPU6050_ScaledData imu_data;
+BMP180_Handle      baro;
+IMU_Data           sensor_data;
+MAG_Handle         mag;
+HeadingFusion_t    fusion;
+float              global_current_heading = 0.0f;
+
+void SensorSys_Init(I2C_HandleTypeDef *hi2c)
+{
+    int init_failed = 0;
+
+    if (MPU6050_Init(&imu, hi2c, ACCEL_SCALE_2G, GYRO_SCALE_250) == MPU6050_OK) {
+        USB_Print("  -> [OK] MPU6050 Connected (I2C3)\r\n");
+    } else {
+        USB_Print("  -> [FAIL] MPU6050 Not Found on I2C3!\r\n");
+        init_failed = 1;
+    }
+
+    /* Enable I2C Bypass on MPU6050 */
+    uint8_t reg_val = 0x00;
+    HAL_I2C_Mem_Write(hi2c, 0xD0, 0x6A, 1, &reg_val, 1, 100);
+    HAL_Delay(10);
+    reg_val = 0x02;
+    HAL_I2C_Mem_Write(hi2c, 0xD0, 0x37, 1, &reg_val, 1, 100);
+    HAL_Delay(100);
+
+    MAG_Init(&mag, hi2c);
+    if (MAG_Read(&mag) == HAL_OK) {
+        USB_Print("  -> [OK] Magnetometer Connected (I2C3)\r\n");
+    } else {
+        USB_Print("  -> [FAIL] Magnetometer Not Found on I2C3!\r\n");
+        init_failed = 1;
+    }
+
+    BMP180_Config baro_cfg = BMP180_DEFAULT_CONFIG(hi2c);
+    if (BMP180_Init(&baro, &baro_cfg) == BMP180_OK) {
+        USB_Print("  -> [OK] BMP180 Connected (I2C3)\r\n");
+    } else {
+        USB_Print("  -> [FAIL] BMP180 Not Found on I2C3!\r\n");
+        init_failed = 1;
+    }
+
+    if (init_failed == 0) {
+        USB_Print("=========================================\r\n");
+        USB_Print(" SUCCESS: ALL SENSORS CONNECTED AND TRUE \r\n");
+        USB_Print("=========================================\r\n\r\n");
+        HeadingFusion_Init(&fusion, 0.98f, mag.heading);
+    } else {
+        USB_Print("=========================================\r\n");
+        USB_Print(" WARNING: SENSOR INITIALIZATION FAILED   \r\n");
+        USB_Print("=========================================\r\n\r\n");
+    }
+}
+

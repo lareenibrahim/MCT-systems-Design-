@@ -1,0 +1,912 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Robot Arm Controller — Dual-mode USB CDC (NO STEPPER)
+  *
+  * SERVO MAPPING (FIXED):
+  *   Servo 1 (PA3) = Joint 2  (TIM2 CH4) — Pi IK "deg2"
+  *   Servo 2 (PA2) = Joint 3  (TIM2 CH3) — Pi IK "deg3"
+  *   Servo 3 (PA1) = Tilt     (TIM2 CH2)
+  *   Servo 4 (PA0) = Gripper  (TIM2 CH1)
+  *
+  * ASCII MODE KEYS:
+  *   1 = Servo 1 (Joint 2)
+  *   2 = Servo 2 (Joint 3)
+  *   3 = Servo 3 (Tilt)
+  *   4 = Servo 4 (Gripper)
+  *
+  * HEARTBEAT: Sends 0x48 ('H') to Pi every HEARTBEAT_INTERVAL_MS
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "usb_device.h"
+
+/* USER CODE BEGIN Includes */
+#include "servo.h"
+#include "limit_switch.h"
+#include "usbd_cdc_if.h"
+#include <string.h>
+#include <stdio.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum {
+	MODE_AUTO   = 0,
+	MODE_PACKET = 1,
+	MODE_ASCII  = 2,
+} CommMode_t;
+
+typedef enum {
+	PKT_WAIT_FF  = 0,
+	PKT_WAIT_AA,
+	PKT_CMD,
+	PKT_B1,
+	PKT_B2,
+	PKT_B3,
+	PKT_B4,
+	PKT_CHECKSUM,
+} PktState_t;
+
+typedef enum {
+	SEL_NONE    = 0,
+	SEL_SERVO1  = 1,   /* Joint 2 — PA3 — key '1' */
+	SEL_SERVO2  = 2,   /* Joint 3 — PA2 — key '2' */
+	SEL_SERVO3  = 3,   /* Tilt    — PA1 — key '3' */
+	SEL_SERVO4  = 4,   /* Gripper — PA0 — key '4' */
+} MotorSel_t;
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* ── Servo angle limits (per servo) ─────────────────────────────────────── */
+#define SERVO1_MIN_DEG              0U    /* Joint 2 */
+#define SERVO1_MAX_DEG              180U
+#define SERVO2_MIN_DEG              0U    /* Joint 3 */
+#define SERVO2_MAX_DEG              180U
+#define SERVO3_MIN_DEG              0U    /* Tilt */
+#define SERVO3_MAX_DEG              60U
+#define SERVO4_MIN_DEG              0U    /* Gripper */
+#define SERVO4_MAX_DEG              180U
+
+/* ── Packet-mode specific limits ────────────────────────────────────────── */
+#define TILT_SERVO_MAX_DEG          60U
+#define GRIPPER_CLOSE_DEG           150U
+#define GRIPPER_OPEN_DEG            0U
+
+/* ── ASCII mode step size ───────────────────────────────────────────────── */
+#define SERVO_STEP_DEG              5U
+
+/* ── Packet framing ─────────────────────────────────────────────────────── */
+#define PKT_HDR1                    0xFFU
+#define PKT_HDR2                    0xAAU
+
+/* ── USB / timing ───────────────────────────────────────────────────────── */
+#define USB_RX_BUF_SIZE             64U
+#define STATUS_PRINT_INTERVAL_MS    500U
+#define MODE_RESET_TIMEOUT_MS       10000U
+
+/* ── Heartbeat ──────────────────────────────────────────────────────────── */
+#define HEARTBEAT_INTERVAL_MS       3000U   /* Change this to adjust heartbeat rate */
+#define HEARTBEAT_CHAR              'H'     /* Character sent to Pi */
+
+/* USER CODE END PD */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+SPI_HandleTypeDef hspi1;
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+
+/* USER CODE BEGIN PV */
+
+/* ── Servo handles ──────────────────────────────────────────────────────── */
+/* NOTE: Hardware mapping is set here — do NOT change the .channel assignments */
+static Servo_Handle_t servo1;   /* Joint 2  TIM2 CH4  PA3 */
+static Servo_Handle_t servo2;   /* Joint 3  TIM2 CH3  PA2 */
+static Servo_Handle_t servo3;   /* Tilt     TIM2 CH2  PA1 */
+static Servo_Handle_t servo4;   /* Gripper  TIM2 CH1  PA0 */
+
+/* ── Communication mode ─────────────────────────────────────────────────── */
+static volatile CommMode_t comm_mode  = MODE_AUTO;
+static volatile uint32_t   last_rx_tick = 0U;
+
+/* ── Packet parser state ────────────────────────────────────────────────── */
+static PktState_t pkt_state = PKT_WAIT_FF;
+static uint8_t    pkt_cmd   = 0U;
+static uint8_t    pkt_b[4]  = {0U};
+
+/* ── ASCII motor selection ──────────────────────────────────────────────── */
+static volatile MotorSel_t selected_motor = SEL_NONE;
+
+/* ── E-stop ─────────────────────────────────────────────────────────────── */
+static volatile uint8_t estop_active = 0U;
+
+/* ── Gripper limit notification latch ───────────────────────────────────── */
+static uint8_t gripper_notified = 0U;
+
+/* ── USB receive buffer (ISR → main-loop handoff) ───────────────────────── */
+static volatile uint8_t  usb_rx_buf[USB_RX_BUF_SIZE];
+static volatile uint32_t usb_rx_len   = 0U;
+static volatile uint8_t  usb_rx_ready = 0U;
+
+/* ── Shared snprintf scratch buffer ─────────────────────────────────────── */
+static char dbg[256];
+
+/* ── Timestamps ─────────────────────────────────────────────────────────── */
+static uint32_t last_status_tick   = 0U;
+static uint32_t last_heartbeat_tick = 0U;
+
+/* ── Print guard (prevents recursive App_Print calls) ───────────────────── */
+static volatile uint8_t printing = 0U;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+
+/* USER CODE BEGIN PFP */
+static void App_Print(const char *msg);
+static void App_Servos_Init(void);
+static void App_ProcessUSB(void);
+static void App_PrintStatus(void);
+static void App_SendHeartbeat(void);
+
+/* Packet-mode helpers */
+static void App_ParseByte_Packet(uint8_t byte);
+static void App_DispatchPacket(uint8_t cmd, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4);
+
+/* ASCII-mode helpers */
+static void App_ParseByte_ASCII(uint8_t byte);
+static void App_PrintMenu(void);
+static void App_ExitMotor(void);
+static void App_HandleR(void);
+static void App_HandleL(void);
+
+/* Servo helper */
+static void App_ServoMoveR(Servo_Handle_t *srv, uint8_t min_deg, uint8_t max_deg, const char *name);
+static void App_ServoMoveL(Servo_Handle_t *srv, uint8_t min_deg, uint8_t max_deg, const char *name);
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Safe USB print — timeout-based, no HAL_Delay
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_Print(const char *msg)
+{
+	uint16_t len = (uint16_t)strlen(msg);
+	if (len == 0U || printing) return;
+
+	printing = 1U;
+	uint32_t timeout = HAL_GetTick() + 100U;
+
+	while (CDC_Transmit_FS((uint8_t *)msg, len) == USBD_BUSY)
+	{
+		if (HAL_GetTick() > timeout) break;
+	}
+	printing = 0U;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Send single-byte heartbeat to Pi
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_SendHeartbeat(void)
+{
+	uint8_t hb = HEARTBEAT_CHAR;
+	CDC_Transmit_FS(&hb, 1U);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Servo initialisation
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_Servos_Init(void)
+{
+	/* Servo 1 — Joint 2 (TIM2 CH4 / PA3) */
+	servo1.htim = &htim2; servo1.channel = TIM_CHANNEL_4;
+	servo1.min_pulse_us = 500U; servo1.max_pulse_us = 2500U;
+	servo1.min_angle = SERVO1_MIN_DEG; servo1.max_angle = SERVO1_MAX_DEG;
+	Servo_Init(&servo1);
+	Servo_SetAngle(&servo1, 0U);  /* Joint 2 home = 0° */
+
+	/* Servo 2 — Joint 3 (TIM2 CH3 / PA2) */
+	servo2.htim = &htim2; servo2.channel = TIM_CHANNEL_3;
+	servo2.min_pulse_us = 500U; servo2.max_pulse_us = 2500U;
+	servo2.min_angle = SERVO2_MIN_DEG; servo2.max_angle = SERVO2_MAX_DEG;
+	Servo_Init(&servo2);
+	Servo_SetAngle(&servo2, 180U);   /* Joint 3 home = 180° */
+
+	/* Servo 3 — Tilt (TIM2 CH2 / PA1) */
+	servo3.htim = &htim2; servo3.channel = TIM_CHANNEL_2;
+	servo3.min_pulse_us = 500U; servo3.max_pulse_us = 2500U;
+	servo3.min_angle = SERVO3_MIN_DEG; servo3.max_angle = SERVO3_MAX_DEG;
+	Servo_Init(&servo3);
+	Servo_SetAngle(&servo3,SERVO3_MAX_DEG);   /* Tilt home = 60° */
+
+	/* Servo 4 — Gripper (TIM2 CH1 / PA0) */
+	servo4.htim = &htim2; servo4.channel = TIM_CHANNEL_1;
+	servo4.min_pulse_us = 500U; servo4.max_pulse_us = 2500U;
+	servo4.min_angle = SERVO4_MIN_DEG; servo4.max_angle = SERVO4_MAX_DEG;
+	Servo_Init(&servo4);
+	Servo_SetAngle(&servo4, GRIPPER_OPEN_DEG);
+
+	App_Print("[INIT] Servos ready. J2=90 J3=0 Tilt=0 Grip=open\r\n");
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Servo R/L helpers (reduce code duplication)
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_ServoMoveR(Servo_Handle_t *srv, uint8_t min_deg, uint8_t max_deg, const char *name)
+{
+	uint8_t a = Servo_GetAngle(srv);
+	a = (a + SERVO_STEP_DEG <= max_deg) ? (a + SERVO_STEP_DEG) : max_deg;
+	Servo_SetAngle(srv, a);
+	snprintf(dbg, sizeof(dbg), "[%s] %u deg\r\n", name, a);
+	App_Print(dbg);
+}
+
+static void App_ServoMoveL(Servo_Handle_t *srv, uint8_t min_deg, uint8_t max_deg, const char *name)
+{
+	uint8_t a = Servo_GetAngle(srv);
+	a = (a >= min_deg + SERVO_STEP_DEG) ? (a - SERVO_STEP_DEG) : min_deg;
+	Servo_SetAngle(srv, a);
+	snprintf(dbg, sizeof(dbg), "[%s] %u deg\r\n", name, a);
+	App_Print(dbg);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  PACKET MODE — parser + dispatcher
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_DispatchPacket(uint8_t cmd, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4)
+{
+	if (estop_active && cmd != 'Z') return;
+
+	switch (cmd)
+	{
+	/* IK angles: Joint2 (servo1/PA3) and Joint3 (servo2/PA2) */
+	case 'W':
+	{
+		float deg_j2 = (float)(((uint16_t)b1 << 8) | b2) / 100.0f;
+		float deg_j3 = (float)(((uint16_t)b3 << 8) | b4) / 100.0f;
+
+		/* Clamp to per-servo limits */
+		if (deg_j2 < (float)SERVO1_MIN_DEG) deg_j2 = (float)SERVO1_MIN_DEG;
+		if (deg_j2 > (float)SERVO1_MAX_DEG) deg_j2 = (float)SERVO1_MAX_DEG;
+		if (deg_j3 < (float)SERVO2_MIN_DEG) deg_j3 = (float)SERVO2_MIN_DEG;
+		if (deg_j3 > (float)SERVO2_MAX_DEG) deg_j3 = (float)SERVO2_MAX_DEG;
+
+		Servo_SetAngle(&servo1, (uint8_t)deg_j2);  /* Joint 2 */
+		Servo_SetAngle(&servo2, (uint8_t)deg_j3);  /* Joint 3 */
+		break;
+	}
+
+	case 'T':
+		Servo_SetAngle(&servo3, TILT_SERVO_MAX_DEG);  /* Tilt up */
+		break;
+
+	case 'Y':
+		Servo_SetAngle(&servo3, 0U);  /* Tilt down */
+		break;
+
+	case '1':  /* Cross press — close gripper (incremental with limit check) */
+	{
+		/* ── Incrementally close gripper, checking limit each step ── */
+		uint8_t current_angle = Servo_GetAngle(&servo4);
+		uint8_t target_angle  = GRIPPER_CLOSE_DEG;
+
+		while (current_angle < target_angle)
+		{
+			/* Check limit switch BEFORE each step */
+			if (gripper_cube_detected)
+			{
+				/* Limit triggered — stop immediately at current angle */
+				snprintf(dbg, sizeof(dbg), "[GRIP] LIMIT at %u deg — stopped!\r\n", current_angle);
+				App_Print(dbg);
+				break;  /* Exit loop, gripper stays at current angle */
+			}
+
+			/* Increment by 2 degrees per step for smooth closing */
+			current_angle += 2U;
+			if (current_angle > target_angle)
+				current_angle = target_angle;
+
+			Servo_SetAngle(&servo4, current_angle);
+
+			/* Small delay to let the servo move and the limit switch settle */
+			HAL_Delay(15U);  /* 15ms per step = ~67 deg/sec */
+		}
+
+		/* If we reached target without hitting limit */
+		if (!gripper_cube_detected)
+		{
+			snprintf(dbg, sizeof(dbg), "[GRIP] Closed → %u deg\r\n", target_angle);
+			App_Print(dbg);
+		}
+		break;
+	}
+
+	case '2':  /* Cross release — open gripper */
+		Servo_SetAngle(&servo4, GRIPPER_OPEN_DEG);
+		gripper_cube_detected = 0U;
+		gripper_notified = 0U;
+		App_Print("[GRIP] Opened → 0 deg\r\n");
+		break;
+
+	default: break;
+	}
+}
+
+static void App_ParseByte_Packet(uint8_t byte)
+{
+	switch (pkt_state)
+	{
+	case PKT_WAIT_FF:
+		if (byte == PKT_HDR1) pkt_state = PKT_WAIT_AA;
+		break;
+	case PKT_WAIT_AA:
+		pkt_state = (byte == PKT_HDR2) ? PKT_CMD : PKT_WAIT_FF;
+		break;
+	case PKT_CMD: pkt_cmd = byte; pkt_state = PKT_B1; break;
+	case PKT_B1: pkt_b[0] = byte; pkt_state = PKT_B2; break;
+	case PKT_B2: pkt_b[1] = byte; pkt_state = PKT_B3; break;
+	case PKT_B3: pkt_b[2] = byte; pkt_state = PKT_B4; break;
+	case PKT_B4: pkt_b[3] = byte; pkt_state = PKT_CHECKSUM; break;
+	case PKT_CHECKSUM:
+	{
+		uint8_t exp = (uint8_t)((pkt_cmd + pkt_b[0] + pkt_b[1] + pkt_b[2] + pkt_b[3]) % 256U);
+		if (byte == exp)
+			App_DispatchPacket(pkt_cmd, pkt_b[0], pkt_b[1], pkt_b[2], pkt_b[3]);
+		pkt_state = PKT_WAIT_FF;
+		break;
+	}
+	default: pkt_state = PKT_WAIT_FF; break;
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  ASCII MODE — Tera Terminal keyboard handler
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_PrintMenu(void)
+{
+	App_Print("\r\n==========================================\r\n");
+	App_Print("   ROBOT ARM TEST — Tera Terminal Control \r\n");
+	App_Print("==========================================\r\n");
+	App_Print("  SERVO MAPPING:\r\n");
+	App_Print("    1  ->  Servo 1 (PA3) — Joint 2\r\n");
+	App_Print("    2  ->  Servo 2 (PA2) — Joint 3\r\n");
+	App_Print("    3  ->  Servo 3 (PA1) — Tilt\r\n");
+	App_Print("    4  ->  Servo 4 (PA0) — Gripper\r\n");
+	App_Print("------------------------------------------\r\n");
+	App_Print("  CONTROLS (after selecting 1-4):\r\n");
+	App_Print("    R  ->  +5 deg\r\n");
+	App_Print("    L  ->  -5 deg\r\n");
+	App_Print("------------------------------------------\r\n");
+	App_Print("  E  ->  Deselect motor\r\n");
+	App_Print("  M  ->  Show this menu\r\n");
+	App_Print("==========================================\r\n\r\n");
+}
+
+static void App_ExitMotor(void)
+{
+	if (selected_motor == SEL_NONE)
+	{
+		App_Print("[EXIT] No motor selected.\r\n");
+		return;
+	}
+
+	const char *names[] = {"", "Servo1 (Joint2)", "Servo2 (Joint3)", "Servo3 (Tilt)", "Servo4 (Gripper)"};
+	snprintf(dbg, sizeof(dbg), "[EXIT] %s deselected.\r\n", names[selected_motor]);
+	App_Print(dbg);
+	selected_motor = SEL_NONE;
+}
+
+static void App_HandleR(void)
+{
+	if (estop_active) return;
+
+	switch (selected_motor)
+	{
+	case SEL_SERVO1: App_ServoMoveR(&servo1, SERVO1_MIN_DEG, SERVO1_MAX_DEG, "Joint2"); break;
+	case SEL_SERVO2: App_ServoMoveR(&servo2, SERVO2_MIN_DEG, SERVO2_MAX_DEG, "Joint3"); break;
+	case SEL_SERVO3: App_ServoMoveR(&servo3, SERVO3_MIN_DEG, SERVO3_MAX_DEG, "Tilt");   break;
+
+	case SEL_SERVO4:
+		if (gripper_cube_detected)
+		{ App_Print("[Gripper] LIMIT ACTIVE - R blocked!\r\n"); break; }
+		App_ServoMoveR(&servo4, SERVO4_MIN_DEG, SERVO4_MAX_DEG, "Gripper");
+		break;
+
+	default:
+		App_Print("[!] Select motor first (1-4).\r\n");
+		break;
+	}
+}
+
+static void App_HandleL(void)
+{
+	if (estop_active) return;
+
+	switch (selected_motor)
+	{
+	case SEL_SERVO1: App_ServoMoveL(&servo1, SERVO1_MIN_DEG, SERVO1_MAX_DEG, "Joint2"); break;
+	case SEL_SERVO2: App_ServoMoveL(&servo2, SERVO2_MIN_DEG, SERVO2_MAX_DEG, "Joint3"); break;
+	case SEL_SERVO3: App_ServoMoveL(&servo3, SERVO3_MIN_DEG, SERVO3_MAX_DEG, "Tilt");   break;
+
+	case SEL_SERVO4:
+	{
+		uint8_t a = Servo_GetAngle(&servo4);
+		a = (a >= SERVO4_MIN_DEG + SERVO_STEP_DEG) ? (a - SERVO_STEP_DEG) : SERVO4_MIN_DEG;
+		Servo_SetAngle(&servo4, a);
+
+		if (gripper_cube_detected && a < (SERVO4_MAX_DEG - 10U))
+		{
+			gripper_cube_detected = 0U;
+			App_Print("[Gripper] Limit cleared.\r\n");
+		}
+		snprintf(dbg, sizeof(dbg), "[Gripper] %u deg\r\n", a);
+		App_Print(dbg);
+		break;
+	}
+
+	default:
+		App_Print("[!] Select motor first (1-4).\r\n");
+		break;
+	}
+}
+
+static void App_ParseByte_ASCII(uint8_t byte)
+{
+	if (byte == 0x1BU || byte == '\r' || byte == '\n') return;
+
+	if (estop_active)
+	{
+		if (byte != '1' && byte != '2' && byte != '3' && byte != '4' &&
+				byte != 'E' && byte != 'e' && byte != 'M' && byte != 'm')
+		{
+			App_Print("[!] E-STOP ACTIVE.\r\n");
+			return;
+		}
+	}
+
+	switch (byte)
+	{
+	case '1':
+		selected_motor = SEL_SERVO1;
+		snprintf(dbg, sizeof(dbg), "[SEL] >> Servo1 JOINT2 (PA3) | %u deg\r\n", Servo_GetAngle(&servo1));
+		App_Print(dbg);
+		break;
+
+	case '2':
+		selected_motor = SEL_SERVO2;
+		snprintf(dbg, sizeof(dbg), "[SEL] >> Servo2 JOINT3 (PA2) | %u deg\r\n", Servo_GetAngle(&servo2));
+		App_Print(dbg);
+		break;
+
+	case '3':
+		selected_motor = SEL_SERVO3;
+		snprintf(dbg, sizeof(dbg), "[SEL] >> Servo3 TILT (PA1) | %u deg\r\n", Servo_GetAngle(&servo3));
+		App_Print(dbg);
+		break;
+
+	case '4':
+		selected_motor = SEL_SERVO4;
+		snprintf(dbg, sizeof(dbg), "[SEL] >> Servo4 GRIPPER (PA0) | %u deg\r\n", Servo_GetAngle(&servo4));
+		App_Print(dbg);
+		break;
+
+	case 'R': case 'r': App_HandleR(); break;
+	case 'L': case 'l': App_HandleL(); break;
+	case 'E': case 'e': App_ExitMotor(); break;
+	case 'M': case 'm': App_PrintMenu(); break;
+
+	default: break;
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Top-level byte router
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_RouteByte(uint8_t byte)
+{
+	last_rx_tick = HAL_GetTick();
+
+	if (comm_mode == MODE_AUTO)
+	{
+		if (byte == PKT_HDR1)
+		{
+			comm_mode = MODE_PACKET;
+			App_Print("[MODE] PACKET\r\n");
+			App_ParseByte_Packet(byte);
+		}
+		else if (byte >= 0x20U && byte < 0x7FU)
+		{
+			comm_mode = MODE_ASCII;
+			App_Print("[MODE] ASCII\r\n");
+			App_PrintMenu();
+			App_ParseByte_ASCII(byte);
+		}
+	}
+	else if (comm_mode == MODE_PACKET)
+	{
+		App_ParseByte_Packet(byte);
+	}
+	else
+	{
+		App_ParseByte_ASCII(byte);
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Process USB RX buffer (main-loop context)
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_ProcessUSB(void)
+{
+	if (usb_rx_ready)
+	{
+		uint32_t len = usb_rx_len;
+		for (uint32_t i = 0U; i < len; i++)
+			App_RouteByte(usb_rx_buf[i]);
+		usb_rx_len   = 0U;
+		usb_rx_ready = 0U;
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Periodic status (ASCII mode only)
+ * ══════════════════════════════════════════════════════════════════════════ */
+static void App_PrintStatus(void)
+{
+	if (comm_mode != MODE_ASCII) return;
+
+	if (estop_active)
+	{ App_Print("[STATUS] *** E-STOP ***\r\n"); return; }
+
+	switch (selected_motor)
+	{
+	case SEL_SERVO1:
+		snprintf(dbg, sizeof(dbg), "[S] Joint2 | %u deg\r\n", Servo_GetAngle(&servo1));
+		App_Print(dbg);
+		break;
+	case SEL_SERVO2:
+		snprintf(dbg, sizeof(dbg), "[S] Joint3 | %u deg\r\n", Servo_GetAngle(&servo2));
+		App_Print(dbg);
+		break;
+	case SEL_SERVO3:
+		snprintf(dbg, sizeof(dbg), "[S] Tilt | %u deg\r\n", Servo_GetAngle(&servo3));
+		App_Print(dbg);
+		break;
+	case SEL_SERVO4:
+		snprintf(dbg, sizeof(dbg), "[S] Gripper | %u deg | %s\r\n",
+				Servo_GetAngle(&servo4),
+				gripper_cube_detected ? "LIMIT" : "OK");
+		App_Print(dbg);
+		break;
+	default:
+		App_Print("[S] No motor selected. Press 1-4.\r\n");
+		break;
+	}
+}
+
+/* USER CODE END 0 */
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  main()
+ * ══════════════════════════════════════════════════════════════════════════ */
+int main(void)
+{
+	HAL_Init();
+	SystemClock_Config();
+
+	MX_GPIO_Init();
+	MX_ADC1_Init();
+	MX_SPI1_Init();
+	MX_TIM1_Init();
+	MX_TIM2_Init();
+	MX_TIM3_Init();
+	MX_USB_DEVICE_Init();
+
+	HAL_Delay(800U);
+
+	LimitSwitch_Init();
+	App_Servos_Init();
+	HAL_TIM_Base_Start(&htim1);
+
+	last_status_tick    = HAL_GetTick();
+	last_heartbeat_tick = HAL_GetTick();
+	last_rx_tick        = HAL_GetTick();
+
+	App_Print("[READY] Dual-mode active. Heartbeat every ");
+	snprintf(dbg, sizeof(dbg), "%u ms.\r\n", HEARTBEAT_INTERVAL_MS);
+	App_Print(dbg);
+
+	while (1)
+	{
+		/* Mode-reset timeout */
+		if (comm_mode != MODE_AUTO &&
+				(HAL_GetTick() - last_rx_tick) >= MODE_RESET_TIMEOUT_MS)
+		{
+			comm_mode      = MODE_AUTO;
+			pkt_state      = PKT_WAIT_FF;
+			selected_motor = SEL_NONE;
+			App_Print("[MODE] AUTO-DETECT\r\n");
+		}
+
+		App_ProcessUSB();
+
+		/* Periodic status */
+		if ((HAL_GetTick() - last_status_tick) >= STATUS_PRINT_INTERVAL_MS)
+		{
+			last_status_tick = HAL_GetTick();
+			App_PrintStatus();
+		}
+
+		/* Heartbeat to Pi */
+		if ((HAL_GetTick() - last_heartbeat_tick) >= HEARTBEAT_INTERVAL_MS)
+		{
+			last_heartbeat_tick = HAL_GetTick();
+			App_SendHeartbeat();
+			 last_rx_tick = HAL_GetTick();
+		}
+
+		/* Gripper limit */
+		if (gripper_cube_detected && !gripper_notified)
+		{
+			gripper_notified = 1U;
+			snprintf(dbg, sizeof(dbg), "[GRIP] Object at %u deg!\r\n", Servo_GetAngle(&servo4));
+			App_Print(dbg);
+		}
+		if (!gripper_cube_detected) gripper_notified = 0U;
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  USB CDC Callback (ISR)
+ * ══════════════════════════════════════════════════════════════════════════ */
+void CDC_Receive_CallBack(uint8_t *Buf, uint32_t Len)
+{
+	if (!usb_rx_ready && Len > 0U && Len <= USB_RX_BUF_SIZE)
+	{
+		for (uint32_t i = 0U; i < Len; i++)
+			usb_rx_buf[i] = Buf[i];
+		usb_rx_len   = Len;
+		usb_rx_ready = 1U;
+	}
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  EXTI Callback
+ * ══════════════════════════════════════════════════════════════════════════ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+	if (GPIO_Pin == E_STOP_Pin)
+	{
+		if (HAL_GPIO_ReadPin(E_STOP_GPIO_Port, E_STOP_Pin) == GPIO_PIN_SET)
+		{
+			estop_active = 1U;
+			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_2);
+			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_3);
+			HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_4);
+		}
+		else
+		{
+			estop_active = 0U;
+			HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+			HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+			HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+			HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
+			Servo_SetAngle(&servo1, Servo_GetAngle(&servo1));
+			Servo_SetAngle(&servo2, Servo_GetAngle(&servo2));
+			Servo_SetAngle(&servo3, Servo_GetAngle(&servo3));
+			Servo_SetAngle(&servo4, Servo_GetAngle(&servo4));
+		}
+		return;
+	}
+	if (GPIO_Pin == NRF_IRQ_Pin) return;
+	LimitSwitch_EXTI_Callback(GPIO_Pin);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  Timer Callback (kept for compatibility, TIM3 no longer used for stepper)
+ * ══════════════════════════════════════════════════════════════════════════ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+	(void)htim;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ *  System Clock & Peripheral Init
+ * ══════════════════════════════════════════════════════════════════════════ */
+void SystemClock_Config(void)
+{
+	RCC_OscInitTypeDef       RCC_OscInitStruct  = {0};
+	RCC_ClkInitTypeDef       RCC_ClkInitStruct  = {0};
+	RCC_PeriphCLKInitTypeDef PeriphClkInit      = {0};
+
+	RCC_OscInitStruct.OscillatorType  = RCC_OSCILLATORTYPE_HSE;
+	RCC_OscInitStruct.HSEState        = RCC_HSE_ON;
+	RCC_OscInitStruct.HSEPredivValue  = RCC_HSE_PREDIV_DIV1;
+	RCC_OscInitStruct.HSIState        = RCC_HSI_ON;
+	RCC_OscInitStruct.PLL.PLLState    = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource   = RCC_PLLSOURCE_HSE;
+	RCC_OscInitStruct.PLL.PLLMUL      = RCC_PLL_MUL9;
+	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+
+	RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+
+	PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC | RCC_PERIPHCLK_USB;
+	PeriphClkInit.AdcClockSelection    = RCC_ADCPCLK2_DIV6;
+	PeriphClkInit.UsbClockSelection    = RCC_USBCLKSOURCE_PLL_DIV1_5;
+	if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC1_Init(void)
+{
+	ADC_ChannelConfTypeDef sConfig = {0};
+	hadc1.Instance = ADC1;
+	hadc1.Init.ScanConvMode       = ADC_SCAN_DISABLE;
+	hadc1.Init.ContinuousConvMode = ENABLE;
+	hadc1.Init.DiscontinuousConvMode = DISABLE;
+	hadc1.Init.ExternalTrigConv   = ADC_SOFTWARE_START;
+	hadc1.Init.DataAlign          = ADC_DATAALIGN_RIGHT;
+	hadc1.Init.NbrOfConversion    = 1;
+	if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+	sConfig.Channel      = ADC_CHANNEL_7;
+	sConfig.Rank         = ADC_REGULAR_RANK_1;
+	sConfig.SamplingTime = ADC_SAMPLETIME_55CYCLES_5;
+	if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_SPI1_Init(void)
+{
+	hspi1.Instance = SPI1;
+	hspi1.Init.Mode = SPI_MODE_MASTER;
+	hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+	hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+	hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+	hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+	hspi1.Init.NSS = SPI_NSS_SOFT;
+	hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+	hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+	hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+	hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+	hspi1.Init.CRCPolynomial = 10;
+	if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM1_Init(void)
+{
+	TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
+	TIM_MasterConfigTypeDef sMasterConfig      = {0};
+	htim1.Instance = TIM1;
+	htim1.Init.Prescaler = 71;
+	htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim1.Init.Period = 65535;
+	htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim1.Init.RepetitionCounter = 0;
+	htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim1) != HAL_OK) Error_Handler();
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) Error_Handler();
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM2_Init(void)
+{
+	TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
+	TIM_MasterConfigTypeDef sMasterConfig      = {0};
+	TIM_OC_InitTypeDef      sConfigOC          = {0};
+	htim2.Instance = TIM2;
+	htim2.Init.Prescaler = 71;
+	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim2.Init.Period = 19999;
+	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+	if (HAL_TIM_Base_Init(&htim2) != HAL_OK) Error_Handler();
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) Error_Handler();
+	if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) Error_Handler();
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 500U;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_3) != HAL_OK) Error_Handler();
+	if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+	HAL_TIM_MspPostInit(&htim2);
+}
+
+static void MX_TIM3_Init(void)
+{
+	TIM_ClockConfigTypeDef  sClockSourceConfig = {0};
+	TIM_MasterConfigTypeDef sMasterConfig      = {0};
+	htim3.Instance = TIM3;
+	htim3.Init.Prescaler = 71;
+	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim3.Init.Period = 999;
+	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+	if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK) Error_Handler();
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK) Error_Handler();
+}
+
+static void MX_GPIO_Init(void)
+{
+	GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+	__HAL_RCC_GPIOD_CLK_ENABLE();
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	HAL_GPIO_WritePin(GPIOA, NRF_CSN_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(NRF_CE_GPIO_Port, NRF_CE_Pin, GPIO_PIN_RESET);
+
+	GPIO_InitStruct.Pin = NRF_CSN_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(NRF_CSN_GPIO_Port, &GPIO_InitStruct);
+
+	GPIO_InitStruct.Pin = NRF_CE_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(NRF_CE_GPIO_Port, &GPIO_InitStruct);
+
+	GPIO_InitStruct.Pin = GRIPPER_LIMIT_Pin;
+	GPIO_InitStruct.Mode = GRIPPER_LIMIT_GPIO_MODE;
+	GPIO_InitStruct.Pull = GRIPPER_LIMIT_GPIO_PULL;
+	HAL_GPIO_Init(GRIPPER_LIMIT_GPIO_Port, &GPIO_InitStruct);
+
+	GPIO_InitStruct.Pin = E_STOP_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING_FALLING;
+	GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+	HAL_GPIO_Init(E_STOP_GPIO_Port, &GPIO_InitStruct);
+
+	GPIO_InitStruct.Pin = TOGGLE_PIN_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(TOGGLE_PIN_GPIO_Port, &GPIO_InitStruct);
+
+	GPIO_InitStruct.Pin = NRF_IRQ_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	HAL_GPIO_Init(NRF_IRQ_GPIO_Port, &GPIO_InitStruct);
+
+	HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0); HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+	HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0); HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+void Error_Handler(void)
+{
+	__disable_irq();
+	while (1) {}
+}

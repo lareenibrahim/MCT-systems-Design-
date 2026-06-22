@@ -1,0 +1,267 @@
+/* Base_Position.c */
+#include "Base_Position.h"
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+extern float global_current_heading; // From main.c
+static float target_heading = 0.0f;
+static float KP_YAW = 1.5f;
+
+// ── ROTATION SPEED CONSTANTS ──
+static const float KP_ROT = 1.2f;
+static const float KI_ROT = 0.0f;
+static const float KD_ROT = 0.5f;
+
+static float rot_integral   = 0.0f;
+static float rot_prev_error = 0.0f;
+
+/* ── Encoder sign correction ── */
+static const int ENC_SIGN[4] = { -1, 1, 1, -1 };
+
+/* ── Speed sign per motor ── */
+static const int CMD_SIGN[4] = { -1, 1, 1, -1 };
+
+static const float CPM[4] = {
+    COUNTS_PER_REV_M1 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M2 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M3 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M4 / (3.14159f * WHEEL_DIAMETER_M),
+};
+
+static PID_t  pid[4];
+static s32    enc_start[4];
+static s32    target_counts[4];
+
+// 0 = Idle, 1 = Moving, 2 = Secure Shutdown
+volatile static int    motion_active = 0;
+volatile static int    is_pure_turn  = 0;
+static int shutdown_ticks = 0;
+
+static float pid_compute(PID_t *p, float error) {
+    p->integral  += error;
+    float deriv   = error - p->prev_error;
+    p->prev_error = error;
+    return KP * error + KI * p->integral + KD * deriv;
+}
+
+// Clamp used ONLY for straight lines / strafing
+static int8_t clamp_cmd(float v) {
+    if (fabsf(v) < 2.5f) return 0;
+
+    if (v >  MAX_SPEED_CMD) v =  MAX_SPEED_CMD;
+    if (v < -MAX_SPEED_CMD) v = -MAX_SPEED_CMD;
+    if (v > 0 && v <  MIN_SPEED_CMD) v =  MIN_SPEED_CMD;
+    if (v < 0 && v > -MIN_SPEED_CMD) v = -MIN_SPEED_CMD;
+    return (int8_t)v;
+}
+
+void Pos_Init(void) {
+    memset(pid, 0, sizeof(pid));
+    motion_active = 0;
+    is_pure_turn  = 0;
+    shutdown_ticks = 0;
+}
+
+void Pos_MoveDistance(float fwd_m, float strafe_m, float rotate_rad) {
+    target_heading = global_current_heading + (rotate_rad * 180.0f / 3.14159f);
+    while (target_heading >= 360.0f) target_heading -= 360.0f;
+    while (target_heading <    0.0f) target_heading += 360.0f;
+
+    float adj_strafe = strafe_m * STRAFE_MULTIPLIER;
+    float adj_rot    = rotate_rad * ROTATE_MULTIPLIER * (WHEEL_BASE_X + WHEEL_BASE_Y);
+
+    float wd[4] = {
+        ( fwd_m - adj_strafe - adj_rot),   /* M1 RR */
+        ( fwd_m + adj_strafe - adj_rot),   /* M2 FR */
+        ( fwd_m + adj_strafe + adj_rot),   /* M3 RL */
+        ( fwd_m - adj_strafe + adj_rot)    /* M4 FL */
+    };
+
+    Motor_ReadEncoders(enc_start);
+    is_pure_turn = 0;
+    shutdown_ticks = 0;
+
+    for (int i = 0; i < 4; i++) {
+        target_counts[i] = (s32)(wd[i] * fabsf(CPM[i]));
+        memset(&pid[i], 0, sizeof(PID_t));
+        pid[i].prev_error = (float)target_counts[i];
+    }
+
+    motion_active = 1;
+}
+
+void Pos_TurnAngle(float angle_degrees) {
+    target_heading = global_current_heading + angle_degrees;
+
+    while (target_heading >= 360.0f) target_heading -= 360.0f;
+    while (target_heading <    0.0f) target_heading += 360.0f;
+
+    Motor_ReadEncoders(enc_start);
+    is_pure_turn = 1;
+    rot_integral   = 0.0f;
+    rot_prev_error = 0.0f;
+    shutdown_ticks = 0;
+
+    for (int i = 0; i < 4; i++) {
+        target_counts[i] = 0;
+        memset(&pid[i], 0, sizeof(PID_t));
+    }
+
+    motion_active = 1;
+}
+
+int Pos_Update(void) {
+    if (!motion_active) {
+        Motor_SetSpeeds(0, 0, 0, 0);
+        return 1;
+    }
+
+    // ── CRITICAL FIX: SECURE SHUTDOWN STATE ──
+    // Guarantees the motor driver receives the stop command even if I2C drops a packet
+    if (motion_active == 2) {
+        Motor_SetSpeeds(0, 0, 0, 0);
+        shutdown_ticks++;
+
+        // Spam 0,0,0,0 for 5 consecutive ticks (100ms) before officially ending the move
+        if (shutdown_ticks >= 5) {
+            motion_active = 0;
+            return 1; // Tell chassis_control we are FINALLY done
+        }
+        return 0; // Keep returning 0 so chassis_control keeps calling us
+    }
+
+    s32 enc_raw[4];
+    Motor_ReadEncoders(enc_raw);
+
+    int8_t cmd[4] = {0};
+    int    done_count = 0;
+
+    float heading_error = target_heading - global_current_heading;
+
+    while (heading_error >  180.0f) heading_error -= 360.0f;
+    while (heading_error < -180.0f) heading_error += 360.0f;
+
+    if (!is_pure_turn && fabsf(heading_error) <= 0.5f) {
+        heading_error = 0.0f;
+    }
+
+    float yaw_corr = KP_YAW * heading_error;
+
+    if (is_pure_turn) {
+        int crossed_target = 0;
+        if (rot_prev_error != 0.0f && fabsf(heading_error) < 45.0f) {
+            if ((rot_prev_error > 0 && heading_error < 0) || (rot_prev_error < 0 && heading_error > 0)) {
+                crossed_target = 1;
+            }
+        }
+
+        if (fabsf(heading_error) <= 4.0f || crossed_target) {
+            done_count = 4;
+        } else {
+            float rot_deriv = heading_error - rot_prev_error;
+            rot_prev_error  = heading_error;
+
+            float rot_cmd_out = (KP_ROT * heading_error) + (KD_ROT * rot_deriv);
+
+            if (rot_cmd_out >  15.0f) rot_cmd_out =  15.0f;
+            if (rot_cmd_out < -15.0f) rot_cmd_out = -15.0f;
+
+            if (rot_cmd_out > 0.0f && rot_cmd_out < 12.0f) rot_cmd_out = 12.0f;
+            if (rot_cmd_out < 0.0f && rot_cmd_out > -12.0f) rot_cmd_out = -12.0f;
+
+            for (int i = 0; i < 4; i++) {
+                float motor_yaw_corr = (i == 0 || i == 1) ? -rot_cmd_out : rot_cmd_out;
+                cmd[i] = (int8_t)(motor_yaw_corr * CMD_SIGN[i]);
+            }
+        }
+    } else {
+        float errors[4];
+        float total_error = 0.0f;
+
+        for (int i = 0; i < 4; i++) {
+            s32 corrected_now   = enc_raw[i]    * ENC_SIGN[i];
+            s32 corrected_start = enc_start[i]  * ENC_SIGN[i];
+            s32 travelled       = corrected_now - corrected_start;
+
+            errors[i] = (float)(target_counts[i] - travelled);
+            total_error += fabsf(errors[i]);
+        }
+
+        for (int i = 0; i < 4; i++) {
+            if (fabsf(errors[i]) <= POSITION_TOL) {
+                pid[i].integral = 0.0f;
+                done_count++;
+            }
+
+            float pid_out = pid_compute(&pid[i], errors[i]);
+
+            float motor_yaw_corr = 0;
+            if (i == 0 || i == 1) motor_yaw_corr = -yaw_corr;
+            if (i == 2 || i == 3) motor_yaw_corr = yaw_corr;
+
+            float total_cmd = pid_out + motor_yaw_corr;
+
+            // Soft Landing Zone
+            if (fabsf(errors[i]) <= (POSITION_TOL * 3.0f)) {
+                if (total_cmd > 25.0f) total_cmd = 25.0f;
+                if (total_cmd < -25.0f) total_cmd = -25.0f;
+                if (fabsf(total_cmd) < 3.0f) total_cmd = 0.0f;
+                cmd[i] = (int8_t)(total_cmd * CMD_SIGN[i]);
+            } else {
+                cmd[i] = clamp_cmd(total_cmd * CMD_SIGN[i]);
+            }
+        }
+    }
+
+    int terminate = 0;
+    if (is_pure_turn) {
+        if (done_count == 4) terminate = 1;
+    } else {
+        float final_avg = 0.0f;
+        for(int i=0; i<4; i++) {
+            final_avg += fabsf((float)target_counts[i] - ((enc_raw[i]*ENC_SIGN[i]) - (enc_start[i]*ENC_SIGN[i])));
+        }
+        final_avg /= 4.0f;
+
+        if (done_count >= 2 || final_avg <= (POSITION_TOL * 2.0f)) {
+            terminate = 1;
+        }
+    }
+
+    // ── ENTER SHUTDOWN INSTEAD OF QUITTING ──
+    if (terminate) {
+        motion_active = 2; // Trigger Secure Shutdown State
+        shutdown_ticks = 0;
+        Motor_SetSpeeds(0, 0, 0, 0);
+        return 0; // Return 0 to keep the timer calling us
+    } else {
+        Motor_SetSpeeds(cmd[0], cmd[1], cmd[2], cmd[3]);
+        return 0;
+    }
+}
+
+void Pos_Abort(void) {
+    motion_active = 0;
+    Motor_SetSpeeds(0, 0, 0, 0);
+}
+
+void Pos_GetDebug(s32 *targets_out, s32 *starts_out) {
+    for (int i = 0; i < 4; i++) {
+        targets_out[i] = target_counts[i];
+        starts_out[i]  = enc_start[i] * ENC_SIGN[i];
+    }
+}
+
+void Pos_GetErrors(int32_t *errors_out) {
+    s32 enc_raw[4];
+    Motor_ReadEncoders(enc_raw);
+
+    for (int i = 0; i < 4; i++) {
+        s32 corrected_now   = enc_raw[i]    * ENC_SIGN[i];
+        s32 corrected_start = enc_start[i]  * ENC_SIGN[i];
+        s32 travelled       = corrected_now - corrected_start;
+
+        errors_out[i] = target_counts[i] - travelled;
+    }
+}

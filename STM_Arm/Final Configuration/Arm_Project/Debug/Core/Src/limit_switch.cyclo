@@ -1,0 +1,2 @@
+../Core/Src/limit_switch.c:22:6:LimitSwitch_Init	1
+../Core/Src/limit_switch.c:33:6:LimitSwitch_EXTI_Callback	5

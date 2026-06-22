@@ -1,0 +1,256 @@
+/* Base_Position.c */
+#include "Base_Position.h"
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+extern float global_current_heading; // From main.c
+static float target_heading = 0.0f;
+static float KP_YAW = 1.5f;          // TUNE THIS: Higher = stronger drift correction
+
+// ── NEW: Dedicated Turning PID Constants ──
+static const float KP_ROT = 2.5f;    // Proportional: Higher = faster initial turn speed
+static const float KI_ROT = 0.05f;   // Integral: Ramps up power if robot gets stuck/buzzes
+static const float KD_ROT = 1.2f;    // Derivative: Smooths out the finish and prevents overshooting
+
+static float rot_integral   = 0.0f;
+static float rot_prev_error = 0.0f;
+
+/* ── Encoder sign correction ── */
+static const int ENC_SIGN[4] = { -1, 1, 1, -1 };
+
+/* ── Speed sign per motor ── */
+/* M1/M4 need -1 to stop gracefully, M2/M3 need 1 to stop gracefully */
+static const int CMD_SIGN[4] = { -1, 1, 1, -1 };
+
+static const float CPM[4] = {
+    COUNTS_PER_REV_M1 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M2 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M3 / (3.14159f * WHEEL_DIAMETER_M),
+    COUNTS_PER_REV_M4 / (3.14159f * WHEEL_DIAMETER_M),
+};
+
+static PID_t  pid[4];
+static s32    enc_start[4];
+static s32    target_counts[4];
+volatile static int    motion_active = 0;
+
+// ── NEW STATE FLAGS ──
+volatile static int    is_pure_turn  = 0;
+
+static float pid_compute(PID_t *p, float error) {
+    p->integral  += error;
+    float deriv   = error - p->prev_error;
+    p->prev_error = error;
+    return KP * error + KI * p->integral + KD * deriv;
+}
+
+static int8_t clamp_cmd(float v) {
+    // Smoothed Deadband: Ignores PID noise exactly equal to KP * POSITION_TOL
+    if (fabsf(v) < 2.5f) return 0;
+
+    if (v >  MAX_SPEED_CMD) v =  MAX_SPEED_CMD;
+    if (v < -MAX_SPEED_CMD) v = -MAX_SPEED_CMD;
+    if (v > 0 && v <  MIN_SPEED_CMD) v =  MIN_SPEED_CMD;
+    if (v < 0 && v > -MIN_SPEED_CMD) v = -MIN_SPEED_CMD;
+    return (int8_t)v;
+}
+
+void Pos_Init(void) {
+    memset(pid, 0, sizeof(pid));
+    motion_active = 0;
+    is_pure_turn  = 0;
+}
+
+void Pos_MoveDistance(float fwd_m, float strafe_m, float rotate_rad) {
+
+    // Update target heading to allow for intended geometric rotations
+    target_heading = global_current_heading + (rotate_rad * 180.0f / 3.14159f);
+    while (target_heading >= 360.0f) target_heading -= 360.0f;
+    while (target_heading <    0.0f) target_heading += 360.0f;
+
+    // 1. Apply efficiency multipliers to the inputs
+    float adj_strafe = strafe_m * STRAFE_MULTIPLIER;
+    float adj_rot    = rotate_rad * ROTATE_MULTIPLIER * (WHEEL_BASE_X + WHEEL_BASE_Y);
+
+    /* STANDARD Mecanum IK Mapping */
+    float wd[4] = {
+        ( fwd_m - adj_strafe + adj_rot),   /* M1 RR */
+        ( fwd_m + adj_strafe + adj_rot),   /* M2 FR */
+        ( fwd_m + adj_strafe - adj_rot),   /* M3 RL */
+        ( fwd_m - adj_strafe - adj_rot)    /* M4 FL */
+    };
+
+    Motor_ReadEncoders(enc_start);
+    is_pure_turn = 0; // Flag as a translation move
+
+    for (int i = 0; i < 4; i++) {
+        target_counts[i] = (s32)(wd[i] * fabsf(CPM[i]));
+        memset(&pid[i], 0, sizeof(PID_t));
+        // Pre-load the error so the derivative doesn't violently spike on start
+        pid[i].prev_error = (float)target_counts[i];
+    }
+
+    extern void USB_Print(const char*);
+    char dbg[160];
+    snprintf(dbg, sizeof(dbg),
+        "[MD] fwd=%.2f str=%.2f rot=%.2f | T:%ld,%ld,%ld,%ld\r\n",
+        fwd_m, strafe_m, rotate_rad,
+        target_counts[0], target_counts[1],
+        target_counts[2], target_counts[3]);
+    USB_Print(dbg);
+
+    motion_active = 1;
+}
+
+void Pos_TurnAbsolute(float target_degrees) {
+    target_heading = target_degrees;
+
+    // Wrap to 0-360
+    while (target_heading >= 360.0f) target_heading -= 360.0f;
+    while (target_heading <    0.0f) target_heading += 360.0f;
+
+    Motor_ReadEncoders(enc_start);
+    is_pure_turn = 1;
+
+    // ── Reset dedicated rotation PID tracking variables ──
+    rot_integral   = 0.0f;
+    rot_prev_error = 0.0f;
+
+    for (int i = 0; i < 4; i++) {
+        target_counts[i] = 0;
+        memset(&pid[i], 0, sizeof(PID_t));
+    }
+
+    motion_active = 1;
+}
+
+int Pos_Update(void) {
+    if (!motion_active) return 1;
+
+    s32 enc_raw[4];
+    Motor_ReadEncoders(enc_raw);
+
+    int8_t cmd[4] = {0};
+    int    done_count = 0;
+
+    float heading_error = target_heading - global_current_heading;
+
+    // Keep error between -180 and 180 (shortest path)
+    while (heading_error >  180.0f) heading_error -= 360.0f;
+    while (heading_error < -180.0f) heading_error += 360.0f;
+
+    // Shrink straight-line deadband so it holds heading tightly
+    if (!is_pure_turn && fabsf(heading_error) <= 0.5f) {
+        heading_error = 0.0f;
+    }
+
+    // Calculate translation correction speed
+    float yaw_corr = KP_YAW * heading_error;
+
+    if (is_pure_turn) {
+        // ── 1. PURE ROTATION LOGIC (Uses Dedicated Gyro PID) ──
+
+        // FIX 1: Widened tolerance. 2.0 is often too narrow; the robot will jump
+        // entirely over the window at MIN_SPEED_CMD. 3.0f allows it to catch properly.
+        if (fabsf(heading_error) <= 3.0f) {
+            done_count = 4;
+        } else {
+            // FIX 2: Prevent Integral Windup. Only build integral power when
+            // close to the target (within 20 degrees).
+            if (fabsf(heading_error) < 20.0f) {
+                rot_integral += heading_error;
+            } else {
+                rot_integral = 0.0f;
+            }
+
+            // Anti-windup clamping
+            if (rot_integral >  300.0f) rot_integral =  300.0f;
+            if (rot_integral < -300.0f) rot_integral = -300.0f;
+
+            float rot_deriv = heading_error - rot_prev_error;
+            rot_prev_error  = heading_error;
+
+            // Compute total PID output for heading
+            float rot_cmd_out = (KP_ROT * heading_error) + (KI_ROT * rot_integral) + (KD_ROT * rot_deriv);
+
+            for (int i = 0; i < 4; i++) {
+                // FIX 3: Positive Feedback Toggle.
+                // If you run this code and the robot STILL spins continuously away from
+                // the target, your IMU reads backwards! Change `rot_cmd_out` to `-rot_cmd_out` below.
+            	float motor_yaw_corr = (i == 0 || i == 1) ? rot_cmd_out : -rot_cmd_out;
+                cmd[i] = clamp_cmd(motor_yaw_corr * CMD_SIGN[i]);
+            }
+        }
+    } else {
+        // ── 2. TRANSLATION LOGIC (Distance + IMU Assist) ──
+        float errors[4];
+        float total_error = 0.0f;
+
+        for (int i = 0; i < 4; i++) {
+            s32 corrected_now   = enc_raw[i]    * ENC_SIGN[i];
+            s32 corrected_start = enc_start[i]  * ENC_SIGN[i];
+            s32 travelled       = corrected_now - corrected_start;
+
+            errors[i] = (float)(target_counts[i] - travelled);
+            total_error += fabsf(errors[i]);
+        }
+
+        // Apply PID & Soft Braking without anchoring
+        for (int i = 0; i < 4; i++) {
+            if (fabsf(errors[i]) <= POSITION_TOL) {
+                pid[i].integral = 0.0f; // Prevent windup buildup
+                done_count++;
+            }
+
+            float pid_out = pid_compute(&pid[i], errors[i]);
+
+            float motor_yaw_corr = 0;
+            if (i == 0 || i == 1) motor_yaw_corr = yaw_corr;       // Right wheels
+            if (i == 2 || i == 3) motor_yaw_corr = -yaw_corr;      // Left wheels
+
+            cmd[i] = clamp_cmd((pid_out + motor_yaw_corr) * CMD_SIGN[i]);
+        }
+    }
+
+    Motor_SetSpeeds(cmd[0], cmd[1], cmd[2], cmd[3]);
+
+    // ── STEP D: CHASSIS CONSENSUS TERMINATION ──
+    float final_avg = 0.0f;
+    for(int i=0; i<4; i++) {
+        final_avg += fabsf((float)target_counts[i] - ((enc_raw[i]*ENC_SIGN[i]) - (enc_start[i]*ENC_SIGN[i])));
+    }
+    final_avg /= 4.0f;
+
+    if (done_count >= 3 || (done_count >= 2 && final_avg <= (POSITION_TOL * 3.0f))) {
+        motion_active = 0;
+        Motor_SetSpeeds(0, 0, 0, 0); // Final synchronized stop
+        return 1;
+    }
+    return 0;
+}
+
+void Pos_Abort(void) {
+    motion_active = 0;
+    Motor_SetSpeeds(0, 0, 0, 0);
+}
+
+void Pos_GetDebug(s32 *targets_out, s32 *starts_out) {
+    for (int i = 0; i < 4; i++) {
+        targets_out[i] = target_counts[i];
+        starts_out[i]  = enc_start[i] * ENC_SIGN[i];
+    }
+}
+
+void Pos_GetErrors(int32_t *errors_out) {
+    s32 enc_raw[4];
+    Motor_ReadEncoders(enc_raw);
+
+    for (int i = 0; i < 4; i++) {
+        s32 corrected_now   = enc_raw[i]    * ENC_SIGN[i];
+        s32 corrected_start = enc_start[i]  * ENC_SIGN[i];
+        s32 travelled       = corrected_now - corrected_start;
+
+        errors_out[i] = target_counts[i] - travelled;
+    }
+}

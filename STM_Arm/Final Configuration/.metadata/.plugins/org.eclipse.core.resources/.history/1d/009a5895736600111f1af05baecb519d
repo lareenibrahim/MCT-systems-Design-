@@ -1,0 +1,27 @@
+/*
+ * sensor_sys.h
+ *
+ *  Created on: Jun 10, 2026
+ *      Author: Osama Mohammed
+ */
+
+#ifndef SENSOR_SYS_H
+#define SENSOR_SYS_H
+
+#include "main.h"
+#include "mpu6050.h"
+#include "mag_sensor.h"
+#include "imu_fusion.h"
+
+// Exported variables so telemetry and chassis can read them
+extern MPU6050            imu;
+extern MPU6050_ScaledData imu_data;
+extern BMP180_Handle      baro;
+extern IMU_Data           sensor_data;
+extern MAG_Handle         mag;
+extern HeadingFusion_t    fusion;
+extern float              global_current_heading;
+
+void SensorSys_Init(I2C_HandleTypeDef *hi2c);
+
+#endif /* SENSOR_SYS_H */

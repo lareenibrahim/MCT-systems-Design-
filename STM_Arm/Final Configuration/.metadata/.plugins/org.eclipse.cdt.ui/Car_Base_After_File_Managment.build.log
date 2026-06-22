@@ -1,0 +1,10 @@
+18:44:58 **** Incremental Build of configuration Debug for project Car_Base_After_File_Managment ****
+make -j16 all 
+arm-none-eabi-size  Car_Base_After_File_Managment.elf 
+   text	   data	    bss	    dec	    hex	filename
+  76536	    712	   7920	  85168	  14cb0	Car_Base_After_File_Managment.elf
+Finished building: default.size.stdout
+ 
+
+18:44:59 Build Finished. 0 errors, 0 warnings. (took 424ms)
+
